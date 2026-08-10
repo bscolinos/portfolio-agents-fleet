@@ -1,0 +1,7 @@
+# Extra deps for the agent fleet on the GPU box (on top of the NVIDIA repo's
+# uv env, which already provides numpy/pandas/cvxpy/cuopt/cuml).
+singlestoredb>=1.16
+openai>=1.40
+boto3>=1.34
+botocore>=1.34
+pandas>=2.0

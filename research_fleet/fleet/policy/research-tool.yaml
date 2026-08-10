@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+# OpenShell policy preset: allow the sandbox agent to reach the host-side
+# templated write-tool server on host.openshell.internal:11510 (the uniform
+# SingleStore write path). Modeled on the built-in local-inference preset.
+preset:
+  name: research-tool
+  description: "Access the host research write-tool server (uniform SingleStore writes) on port 11510"
+
+network_policies:
+  research_tool:
+    name: research_tool
+    endpoints:
+      - host: host.openshell.internal
+        port: 11510
+        protocol: rest
+        enforcement: enforce
+        allowed_ips:
+          # OpenShell's SSRF guard rejects the private host-gateway IP (172.18.0.1)
+          # unless the policy explicitly allowlists the resolved private range.
+          - 10.0.0.0/8
+          - 172.16.0.0/12
+          - 192.168.0.0/16
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/node }
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/python3 }

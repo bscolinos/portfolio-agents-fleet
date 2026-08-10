@@ -1,0 +1,32 @@
+# ── Secrets — NEVER commit ────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+!**/.env.example
+*.pem
+*.key
+.aura_key*
+.proxy_token
+fleet_nodes.txt
+credentials*
+*_verified
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# ── Node / Next.js ────────────────────────────────────────────────────────
+node_modules/
+.next/
+out/
+npm-debug.log*
+
+# ── Misc ──────────────────────────────────────────────────────────────────
+.DS_Store
+demo.yaml
+*.log
+staging/
+data/stock_data/

@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# OpenShell policy preset: allow the sandbox agent to reach the hosted Aura
+# proxy (dedicated EC2, private IP 172.31.12.154:8799) for NL analytics over
+# SingleStore. The proxy fronts the REAL Aura Analyst domain (not a local substitute).
+#
+# NOTE: `allowed_ips` is NOT permitted in user-supplied presets (built-in only).
+# For a raw private host we combine an L4 access:full/tls:skip endpoint (the
+# gmail.yaml pattern) with `--trusted-private-host 172.31.12.154:8799` at apply
+# time so the SSRF guard admits the private address.
+preset:
+  name: aura-proxy
+  description: "Access the hosted Aura Analyst proxy (NL analytics over SingleStore) at 172.31.12.154:8799"
+
+network_policies:
+  aura_proxy:
+    name: aura_proxy
+    endpoints:
+      - host: 172.31.12.154
+        port: 8799
+        access: full
+        tls: skip
+    binaries:
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/node }
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/python3 }

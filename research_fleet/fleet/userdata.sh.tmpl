@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# ============================================================================
+# EC2 userdata bootstrap for ONE auto-research agent node.
+# Runs the FULL openclaw-through-nemoclaw stack on Ubuntu 24.04 / t3.xlarge:
+#   Docker + Node 22 -> local OpenAI->Bedrock inference shim (systemd) ->
+#   NemoClaw non-interactive install (OpenClaw agent, custom provider ->
+#   the shim) -> the research agent loop (systemd) writing to SingleStore.
+#
+# Placeholders __LIKE_THIS__ are substituted per-node by launch_fleet.sh.
+# All secrets arrive here already inlined (the file itself is the secret; the
+# instance's IMDS/userdata is only readable from the box + operator).
+# ============================================================================
+set -euxo pipefail
+exec > /var/log/research-agent-bootstrap.log 2>&1
+echo "=== bootstrap start $(date -u) ==="
+
+AGENT_ID="__AGENT_ID__"
+AGENT_NAME="__AGENT_NAME__"
+AGENT_FOCUS="__AGENT_FOCUS__"
+AGENT_MODEL="__AGENT_MODEL__"
+HOME_DIR=/opt/research-agent
+export DEBIAN_FRONTEND=noninteractive
+
+# ---------------------------------------------------------------------------
+# 1. Base packages: docker, python, node 22, build tools the installer needs
+# ---------------------------------------------------------------------------
+apt-get update -y
+apt-get install -y ca-certificates curl gnupg git python3 python3-venv python3-pip \
+  binutils zstd jq tmux unzip
+
+# Docker (NemoClaw/OpenShell run the sandbox as a docker container)
+install -m0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+. /etc/os-release
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" \
+  > /etc/apt/sources.list.d/docker.list
+apt-get update -y
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+systemctl enable --now docker
+usermod -aG docker ubuntu || true
+
+# Node 22 (NemoClaw requires >=22.19)
+curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+apt-get install -y nodejs
+node --version
+
+# ---------------------------------------------------------------------------
+# 2. Lay down the agent package + secrets
+# ---------------------------------------------------------------------------
+mkdir -p "$HOME_DIR"
+cat > "$HOME_DIR/.env" <<'ENVEOF'
+__ENV_CONTENTS__
+ENVEOF
+chmod 600 "$HOME_DIR/.env"
+
+# research_agent python package (base64 tarball, decoded here)
+echo "__AGENT_PKG_B64__" | base64 -d > /tmp/research_agent.tgz
+tar -xzf /tmp/research_agent.tgz -C "$HOME_DIR"
+# inference shim
+echo "__SHIM_B64__" | base64 -d > "$HOME_DIR/inference_shim.py"
+
+# python venv with deps
+python3 -m venv "$HOME_DIR/venv"
+"$HOME_DIR/venv/bin/pip" install --upgrade pip
+"$HOME_DIR/venv/bin/pip" install singlestoredb openai boto3 botocore pandas numpy requests
+chown -R ubuntu:ubuntu "$HOME_DIR"
+
+# ---------------------------------------------------------------------------
+# 3. Inference shim as a systemd service (OpenAI-compat -> SingleStore Bedrock)
+#    OpenShell reaches it at host.openshell.internal:11500
+# ---------------------------------------------------------------------------
+cat > /etc/systemd/system/inference-shim.service <<EOF
+[Unit]
+Description=OpenAI->Bedrock inference shim for OpenClaw
+After=network-online.target
+Wants=network-online.target
+[Service]
+User=ubuntu
+WorkingDirectory=$HOME_DIR
+EnvironmentFile=$HOME_DIR/.env
+Environment=SHIM_PORT=11500
+ExecStart=$HOME_DIR/venv/bin/python $HOME_DIR/inference_shim.py
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now inference-shim.service
+sleep 4
+curl -sf http://127.0.0.1:11500/health && echo " shim-up" || echo " shim-DOWN"
+
+# ---------------------------------------------------------------------------
+# 4. NemoClaw non-interactive install: OpenClaw agent + custom provider -> shim
+#    (custom provider speaks OpenAI Chat Completions; Bearer JWT injected)
+# ---------------------------------------------------------------------------
+# The sandbox reaches the host shim via host.openshell.internal (the gateway
+# maps it). Pin it as a trusted private host + exact port so egress is allowed.
+export NEMOCLAW_INSTALL_REF="__NEMOCLAW_REF__"
+runuser -l ubuntu -c "
+  set -eux
+  export NEMOCLAW_NON_INTERACTIVE=1
+  export NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE=1
+  export NEMOCLAW_AGENT=openclaw
+  export NEMOCLAW_PROVIDER=custom
+  export NEMOCLAW_PREFERRED_API=openai-completions
+  export NEMOCLAW_ENDPOINT_URL='http://host.openshell.internal:11500/v1'
+  export COMPATIBLE_API_KEY='__HAIKU_KEY__'
+  export NEMOCLAW_SANDBOX_NAME='research-${AGENT_ID}'
+  export NEMOCLAW_POLICY_TIER=balanced
+  export NEMOCLAW_WEB_SEARCH_PROVIDER=none
+  export NEMOCLAW_TRUSTED_PRIVATE_HOSTS='host.openshell.internal:11500'
+  export NEMOCLAW_INSTALL_REF='__NEMOCLAW_REF__'
+  curl -fsSL \"https://raw.githubusercontent.com/NVIDIA/NemoClaw/__NEMOCLAW_REF__/install.sh\" | \
+    NEMOCLAW_INSTALL_REF='__NEMOCLAW_REF__' NEMOCLAW_NON_INTERACTIVE=1 NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE=1 \
+    NEMOCLAW_AGENT=openclaw NEMOCLAW_PROVIDER=custom NEMOCLAW_PREFERRED_API=openai-completions \
+    NEMOCLAW_ENDPOINT_URL='http://host.openshell.internal:11500/v1' COMPATIBLE_API_KEY='__HAIKU_KEY__' \
+    NEMOCLAW_SANDBOX_NAME='research-${AGENT_ID}' NEMOCLAW_POLICY_TIER=balanced \
+    NEMOCLAW_WEB_SEARCH_PROVIDER=none NEMOCLAW_TRUSTED_PRIVATE_HOSTS='host.openshell.internal:11500' \
+    bash
+" > /var/log/nemoclaw-install.log 2>&1 || echo "NEMOCLAW_INSTALL_NONZERO (see /var/log/nemoclaw-install.log)"
+
+# ---------------------------------------------------------------------------
+# 5. The research agent loop as a systemd service.
+#    It writes hypotheses/experiments/findings to SingleStore over time and
+#    (when NemoClaw+OpenClaw are healthy) drives the agent for reasoning; it
+#    falls back to the direct inference path via the shim otherwise, so the
+#    node produces research results regardless of sandbox state.
+# ---------------------------------------------------------------------------
+cat > /etc/systemd/system/research-agent.service <<EOF
+[Unit]
+Description=Auto-research agent loop ($AGENT_ID)
+After=network-online.target inference-shim.service
+Wants=network-online.target
+[Service]
+User=ubuntu
+WorkingDirectory=$HOME_DIR
+EnvironmentFile=$HOME_DIR/.env
+Environment=AGENT_ID=$AGENT_ID
+Environment=AGENT_NAME=$AGENT_NAME
+Environment=AGENT_FOCUS=$AGENT_FOCUS
+Environment=AGENT_MODEL=$AGENT_MODEL
+Environment=PYTHONUNBUFFERED=1
+ExecStart=$HOME_DIR/venv/bin/python -m research_agent.agent_loop --agent-id $AGENT_ID --display-name "$AGENT_NAME" --focus "$AGENT_FOCUS" --model $AGENT_MODEL --idle-sleep 180
+Restart=always
+RestartSec=10
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now research-agent.service
+
+echo "=== bootstrap done $(date -u) ==="

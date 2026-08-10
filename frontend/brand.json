@@ -1,0 +1,31 @@
+{
+  "nvidia": {
+    "green": "#76B900",
+    "greenDark": "#5B8F00",
+    "black": "#000000"
+  },
+  "singlestore": {
+    "primary": "#820DDF",
+    "primaryLight": "#D199FF",
+    "primaryDeep": "#360061",
+    "ink": "#1B1A2E"
+  },
+  "app": {
+    "bg": "#0A0C11",
+    "panel": "#141824",
+    "panelRaised": "#1C2130",
+    "text": "#E7EAF0",
+    "textMuted": "#8A93A6",
+    "grid": "#252B3A",
+    "border": "#2C3346",
+    "positive": "#76B900",
+    "negative": "#FF5C5C"
+  },
+  "agentColors": {
+    "max-sharpe": "#76B900",
+    "min-cvar": "#1f77b4",
+    "risk-parity": "#9467bd",
+    "max-return": "#d62728",
+    "equal-weight": "#7f7f7f"
+  }
+}
