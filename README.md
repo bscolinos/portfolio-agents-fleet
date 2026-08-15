@@ -195,20 +195,28 @@ for the full fleet + Aura deployment runbooks.
 
 ## Production readiness
 
-The Aura proxy is production-grade. The **research/backtest/trading path is not yet** suitable
-for real capital:
+A safety-first hardening pass has landed. See
+[`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md) for the full go/no-go summary and
+[`RISK_CONTROLS.md`](RISK_CONTROLS.md) for the operator runbook.
 
-- **Backtest cost realism** — the engine undercharges turnover cost (a stated `turnover_cost_bps`
-  can be ignored); absolute Sharpe on high-turnover strategies is overstated. Fix before trusting
-  any single number.
-- **No point-in-time / survivorship-bias controls**; fixed ticker universe; simplified NumPy
-  engine (no slippage/borrow/liquidity modeling).
-- **No execution layer, risk limits, or kill-switch** between a "finding" and an order.
-- Single-region, single proxy instance (no HA); no alerting on circuit-open / error-rate.
-- Trust the **computed metrics**, not the LLM narrative (prose can cite fabricated priors).
+**Done + verified (23 tests passing):**
 
-Before real money: add a realistic cost model, point-in-time + survivorship controls, and a hard
-risk/execution gate with a kill-switch — and paper-trade the chosen strategy through that gate first.
+- **Backtest cost realism — fixed.** Cost now resolves `turnover_cost_bps` (the key the agents
+  actually emit) → `tc_bps` → 5bps default, plus a 2bps slippage leg on real turnover. Re-scoring
+  all 146 experiments flipped `beats_benchmark` on 35 of them — many "winners" were cost-inflated
+  mirages. The top strategy survived because it barely trades (binary trend filter).
+- **Look-ahead / survivorship — mitigated.** As-of trailing-history eligibility replaces
+  full-future-window completeness; leaky forward-fill removed. Residual limitation (no
+  point-in-time membership table) is documented in every result's `data_caveats`.
+- **Hard pre-trade risk/execution gate + kill-switch.** Fail-closed gate (position/exposure/turnover/
+  drawdown/daily-loss/price-sanity/notional limits), a persisted fleet-wide kill switch, and a
+  paper-trading shadow book — every decision audited. Wired into `runner.py` (opt-in `--enforce-risk`).
+
+**Still gating a real-money order (honest):** no real broker adapter (`mode='live'` hits the internal
+simulated book), no ADV/liquidity data, no point-in-time market feed, sector limits inactive until
+`securities.sector` is populated, no restricted-list/borrow checks, no per-agent execution lock.
+Trust the **computed metrics**, not the LLM narrative. **Run paper mode only** until the broker
+adapter, ADV data, and a clean feed are in place.
 
 ---
 

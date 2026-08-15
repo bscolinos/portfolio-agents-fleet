@@ -4,4 +4,5 @@ Persisted agent memory (Qwen VECTOR recall) + Goldman-level trade tracking,
 wrapping NVIDIA's cuOpt/cuML portfolio optimizers.
 """
 
-__all__ = ["db", "config", "trading", "strategies", "runner", "fleet", "llm"]
+__all__ = ["db", "config", "trading", "strategies", "runner", "fleet", "llm",
+           "risk_gate", "kill_switch", "paper_trader"]

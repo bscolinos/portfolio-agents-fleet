@@ -116,7 +116,8 @@ def prices_on(date: str, tickers: list[str]) -> dict:
 
 def run_backtest(*, start: str, end: str, universe_n: int, rebalance_freq: int,
                  lookback: int, starting_nav: float = 100_000_000.0,
-                 reflect: bool = True, agents: list[str] | None = None) -> dict:
+                 reflect: bool = True, agents: list[str] | None = None,
+                 enforce_risk: bool = False) -> dict:
     ensure_repo_on_path()
     register_agents()
     agent_ids = agents or [a.agent_id for a in ROSTER]
@@ -149,7 +150,11 @@ def run_backtest(*, start: str, end: str, universe_n: int, rebalance_freq: int,
                     r = run_rebalance(
                         aid, as_of_date=d, lookback_start=lb_start, lookback_end=lb_end,
                         universe=universe, prices=px,
-                        starting_nav=starting_nav, do_reflect=reflect)
+                        starting_nav=starting_nav, do_reflect=reflect,
+                        enforce_risk=enforce_risk)
+                    if r.get("blocked"):
+                        print(f"  {d} {aid:14s} BLOCKED by risk gate: {r.get('reason','')[:80]}")
+                        continue
                     summary[aid]["runs"] += 1
                     summary[aid]["solve_ms"] += r["solve_ms"] or 0.0
                     summary[aid]["gpu" if r["engine"] == "gpu" else "cpu"] += 1
@@ -189,6 +194,9 @@ def main(argv=None):
     bt.add_argument("--lookback", type=int, default=252)
     bt.add_argument("--starting-nav", type=float, default=100_000_000.0)
     bt.add_argument("--no-reflect", action="store_true")
+    bt.add_argument("--enforce-risk", action="store_true",
+                    help="insert the pre-trade risk gate (off by default so a plain "
+                         "backtest replay is unaffected)")
     bt.add_argument("--agents", default="")
 
     sub.add_parser("register")
@@ -203,7 +211,7 @@ def main(argv=None):
         run_backtest(start=args.start, end=args.end, universe_n=args.universe,
                      rebalance_freq=args.rebalance_freq, lookback=args.lookback,
                      starting_nav=args.starting_nav, reflect=not args.no_reflect,
-                     agents=agents)
+                     agents=agents, enforce_risk=args.enforce_risk)
 
 
 if __name__ == "__main__":

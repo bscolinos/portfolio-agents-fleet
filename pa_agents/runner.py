@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 
 from . import db, llm
+from . import risk_gate
 from .strategies import AgentSpec, ROSTER, ROSTER_BY_ID, optimize
 from .trading import CostModel, rebalance
 
@@ -130,8 +131,19 @@ def run_rebalance(
     prices: dict[str, float] | None = None,
     starting_nav: float | None = None,
     do_reflect: bool = True,
+    enforce_risk: bool = False,
+    risk_limits: "risk_gate.RiskLimits | None" = None,
 ) -> dict:
-    """Run one full memory->solve->trade->reflect cycle for a single agent."""
+    """Run one full memory->solve->trade->reflect cycle for a single agent.
+
+    ``enforce_risk`` (default False) inserts the pre-trade :mod:`risk_gate`
+    between SOLVE and TRADE. It is OFF by default so a historical backtest replay
+    is unaffected (the gate's drawdown/turnover/loss checks would otherwise block
+    legitimate simulated rebalances and corrupt the equity curve). Turn it ON for
+    a *gated* replay or any forward/real path: a rejected rebalance is skipped
+    (no orders) and audited, and the run is marked ``blocked``. When the gate
+    clips weights (over-weight names), the adjusted vector is what gets traded.
+    """
     spec = ROSTER_BY_ID[agent_id]
     run_id = _uid(f"run-{agent_id}")
     started = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -180,10 +192,49 @@ def run_rebalance(
                      "scenario_ms": res.scenario_ms, "num_scenarios": res.num_scenarios,
                      "n_weights": len(res.weights), "metrics": res.metrics})
 
+    # 3.5) RISK GATE (opt-in) — pre-trade check between SOLVE and TRADE.
+    # Fail-closed: a rejected rebalance places NO orders and is audited.
+    trade_weights = res.weights
+    if enforce_risk:
+        # On inception (no nav_history yet) supply starting_nav so the gate isn't
+        # forced to fail-closed on the very first trade; an established agent's
+        # live marked NAV is read from the book by the gate itself.
+        has_hist = db.query(
+            "SELECT 1 FROM nav_history WHERE agent_id=%s LIMIT 1", (agent_id,))
+        seed_nav = None if has_hist else (starting_nav or 100_000_000.0)
+        gate_limits = risk_limits or risk_gate.RiskLimits()
+        if not has_hist:
+            # Inception funding (cash -> invested) is 100% one-way turnover by
+            # construction, not churn; its size is already bound by the gross
+            # cap. Relax only the turnover limit for the very first trade so the
+            # gate doesn't reject legitimate initial deployment.
+            import dataclasses as _dc
+            gate_limits = _dc.replace(gate_limits, max_turnover=gate_limits.max_gross_exposure)
+        decision = risk_gate.evaluate(
+            agent_id=agent_id, as_of_date=as_of_date, target_weights=res.weights,
+            prices=prices, nav=seed_nav, limits=gate_limits, run_id=run_id, mode="live")
+        if not decision.approved:
+            db.execute(
+                "UPDATE agent_runs SET status='blocked', error=%s, finished_at=NOW(6) WHERE run_id=%s",
+                (decision.reason[:500], run_id))
+            db.audit(_uid("aud"), agent_id, "RUN_END", run_id=run_id,
+                     detail={"blocked": True, "reason": decision.reason,
+                             "violations": decision.violations})
+            return {"run_id": run_id, "agent_id": agent_id, "as_of_date": as_of_date,
+                    "engine": res.engine, "gpu_name": res.gpu_name,
+                    "solve_ms": res.solve_ms, "scenario_ms": res.scenario_ms,
+                    "num_scenarios": res.num_scenarios, "n_orders": 0, "n_positions": 0,
+                    "nav_after": None, "turnover": 0.0, "sharpe": res.metrics.get("sharpe"),
+                    "recalled": len(memories), "wrote_learning": False,
+                    "blocked": True, "reason": decision.reason,
+                    "violations": decision.violations}
+        # honor any gate-clipped weights (e.g. over-weight names capped + renormalized)
+        trade_weights = decision.adjusted_weights or res.weights
+
     # 4) TRADE ---------------------------------------------------------------
     reb = rebalance(
         run_id=run_id, agent_id=agent_id, as_of_date=as_of_date,
-        target_weights=res.weights, prices=prices,
+        target_weights=trade_weights, prices=prices,
         cost_model=CostModel(), starting_nav=starting_nav,
     )
 
