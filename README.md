@@ -196,8 +196,10 @@ for the full fleet + Aura deployment runbooks.
 ## Production readiness
 
 A safety-first hardening pass has landed. See
-[`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md) for the full go/no-go summary and
-[`RISK_CONTROLS.md`](RISK_CONTROLS.md) for the operator runbook.
+[`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md) for the full go/no-go summary,
+[`RISK_CONTROLS.md`](RISK_CONTROLS.md) for the operator runbook, and
+[`STRATEGY_SWEEP.md`](STRATEGY_SWEEP.md) for the 2,448-config out-of-sample sweep that
+selects the winner honestly (in-sample leader collapses to rank #30 out-of-sample).
 
 **Done + verified (23 tests passing):**
 
