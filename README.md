@@ -159,6 +159,7 @@ agentic_loop --transport switchyard
 | `schema.sql` | Portfolio-agents schema (prices, memory, orders, fills, NAV, risk, audit) |
 | `research_fleet/research_agent/` | Research-agent runtime: **`agentic_loop`** (host-side Claude tool-use loop), **`agent_tools`** (recall/backtest/sweep/write tools), **`switchyard_transport`** (routes turns through NeMo Switchyard), `backtest`, `write_tool`, `analyst`, `prompts`, `research_db`, `llm_driver` (legacy `agent_loop` retained) |
 | `research_fleet/fleet/` | Fleet deploy: `inference_shim` (OpenAI↔Bedrock-Converse, tool-use + structured output), **`routes.toml`** (Switchyard 3-tier classifier), `systemd/` units, NemoClaw/OpenShell onboard, tool server, policies |
+| `research_fleet/console.py` | **Live research console** — single-file FastAPI + embedded HTML dashboard over the real `research_*` tables (fleet liveness, streaming activity feed, backtest metrics, findings, and live Switchyard tier routing). Read-only, no LLM calls |
 | `research_fleet/aura/` | **Hosted Aura Analyst proxy**: `aura_proxy.py`, schema, deploy |
 | `research_fleet/research_schema.sql` | Research tables (tasks, hypotheses, experiments, findings, activity, analyst queries) |
 | `docs/PORTFOLIO_AGENTS.md` | Deep-dive on the portfolio-agents subsystem |
@@ -209,6 +210,9 @@ bash run_demo.sh                             # FastAPI :8210 + Next.js :3011
 #    userdata -> NemoClaw/OpenShell onboard -> shim + tool-server + agent loop
 #    wire to the hosted Aura proxy:
 bash research_fleet/fleet/wire_aura_proxy.sh <node-ip> <agent-id>
+
+# 4. watch the fleet live (read-only console over the research_* tables)
+python research_fleet/console.py --port 8215     # open http://localhost:8215
 ```
 
 See [`research_fleet/README.md`](research_fleet/README.md) and
