@@ -1,0 +1,108 @@
+# NVIDIA NeMo Switchyard — 3-tier complexity router for the research fleet.
+#
+# A cheap classifier grades each task's complexity and routes:
+#   low complexity      -> fast      (Claude Haiku)
+#   medium complexity   -> balanced  (Claude Sonnet)
+#   high / unsupported  -> reasoning (Claude Opus)
+#
+# Every target points at the LOCAL inference shim (127.0.0.1:11500), which speaks
+# the OpenAI Chat wire format Switchyard emits and translates to the SingleStore
+# Bedrock-Converse gateway, injecting the correct per-tier JWT based on the model
+# name Switchyard sends (haiku/sonnet/opus). So the raw model JWTs live ONLY in
+# the shim's env, never in this file. The classifier's structured-output request
+# (response_format json_schema) is served by the shim's forced-tool path.
+#
+# Clients call Switchyard's OpenAI endpoint with model = "research" (the route id).
+# Run: switchyard-server --config routes.toml --host 127.0.0.1 --port 4000
+
+schema_version = 1
+
+# ---------------------------------------------------------------------------
+# Upstream: the local shim. `api_key_env` is required by Switchyard but the shim
+# selects the JWT by model name and ignores the inbound key, so a placeholder is
+# fine. Keep it as an env var (never inline a secret).
+# ---------------------------------------------------------------------------
+[llm_clients.shim]
+format = "openai_chat"
+base_url = "http://127.0.0.1:11500/v1"
+api_key_env = "SWITCHYARD_UPSTREAM_KEY"
+
+# ---------------------------------------------------------------------------
+# Targets — one per tier. `id` is the model name sent upstream (to the shim),
+# which maps it to (model_id, JWT). Give the classifier plenty of output room
+# for the structured verdict.
+# ---------------------------------------------------------------------------
+# NOTE: Switchyard drops duplicate (model id, client) targets, so the two
+# haiku-backed targets use DISTINCT ids. The shim resolves by substring, so
+# "haiku-classifier" and "haiku-fast" both map to the real haiku model + JWT.
+[targets.classifier]
+id = "haiku-classifier"
+llm_client = "shim"
+
+[targets.fast]
+id = "haiku-fast"
+llm_client = "shim"
+
+[targets.balanced]
+id = "sonnet"
+llm_client = "shim"
+
+[targets.reasoning]
+id = "opus"
+llm_client = "shim"
+
+# ---------------------------------------------------------------------------
+# The route: custom multi-target LLM-classifier. The classifier returns a
+# verdict object; the target_selector policy reads /decision/target and routes
+# to that tier. An unknown/missing verdict falls back to default_target
+# (reasoning) — fail toward MORE capability, the safe direction for real-money
+# research where a mis-routed hard task is worse than an over-spent easy one.
+# ---------------------------------------------------------------------------
+[routes.research]
+id = "research"
+type = "llm_classifier"
+mode = "custom"
+classifier_target = "classifier"
+targets = ["fast", "balanced", "reasoning"]
+default_target = "reasoning"
+session_affinity = false
+max_output_tokens = 2048
+prompt = """
+You are a routing classifier for an autonomous quant-research agent working on
+S&P 500 trading strategies. Estimate the complexity of the user's CURRENT task
+and choose the cheapest model tier that can do it well. Tiers:
+- "fast": simple, mechanical, or low-stakes steps — recalling prior findings,
+  reading sweep results, a single well-specified backtest, routine bookkeeping,
+  short factual answers.
+- "balanced": moderate reasoning — forming a normal hypothesis, interpreting a
+  backtest, comparing a couple of configurations, standard analysis.
+- "reasoning": HIGH complexity or high stakes — multi-step strategy design,
+  reconciling conflicting/overfit evidence, in-sample vs out-of-sample judgment,
+  designing a robustness/validation plan, anything feeding a real-money decision,
+  or when you are uncertain. Prefer this tier whenever the task is genuinely hard.
+Return JSON matching the response schema supplied with the request. Do not add
+prose outside the JSON.
+"""
+response_schema = '''
+{
+  "type": "object",
+  "properties": {
+    "decision": {
+      "type": "object",
+      "properties": {
+        "target": { "type": "string", "enum": ["fast", "balanced", "reasoning"] },
+        "complexity": { "type": "string", "enum": ["low", "medium", "high"] },
+        "reason": { "type": "string" }
+      },
+      "required": ["target"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["decision"],
+  "additionalProperties": false
+}
+'''
+
+[routes.research.policy]
+type = "target_selector"
+selector = "/decision/target"

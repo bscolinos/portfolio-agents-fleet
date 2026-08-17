@@ -1,0 +1,15 @@
+[Unit]
+Description=NVIDIA NeMo Switchyard router (complexity-based model routing)
+After=network-online.target inference-shim.service
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/research-agent
+Environment=SWITCHYARD_UPSTREAM_KEY=placeholder
+ExecStart=/home/ubuntu/.local/bin/switchyard-server --config /opt/research-agent/routes.toml --host 127.0.0.1 --port 4000 --routing-log-file /opt/research-agent/switchyard-routing.jsonl
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -123,6 +123,30 @@ the sandbox reaches the host **write-tool** and the **Aura proxy** only through 
 policy presets. Net effect: **the credential never enters the sandbox**, and **every write is
 schema-validated host-side** so data stays uniform across the fleet.
 
+### Agent-driven loop + complexity routing (NeMo Switchyard)
+
+The research runtime is a **host-side Claude tool-use loop** (`agentic_loop.py`): the model
+itself decides each action — recall prior findings, inspect the sweep, form a hypothesis, run a
+**real** backtest, interpret it, write the result — then picks the next thing. It cannot fabricate
+metrics (numbers come from `run_backtest`), and it runs continuously (no queue to drain). Tools are
+defined in `agent_tools.py`.
+
+Model selection is handled by **[NVIDIA NeMo Switchyard](https://github.com/NVIDIA-NeMo/Switchyard)**
+— its `llm_classifier` route (custom mode) grades each cycle's complexity and routes across three
+tiers: `fast` → **Haiku**, `balanced` → **Sonnet**, `reasoning` → **Opus** (config in `routes.toml`,
+`default_target = reasoning` so uncertain/hard tasks fail toward capability). Switchyard speaks the
+OpenAI wire format; the upgraded shim translates tool-use *and* structured-output (the classifier's
+JSON verdict) to Bedrock Converse. The loop reaches it via `switchyard_transport.py`, selected with
+`agentic_loop --transport switchyard` (default `bedrock` is the direct, always-available fallback,
+since Switchyard is pre-alpha).
+
+```
+agentic_loop --transport switchyard
+   → switchyard-server :4000  (classify cycle → fast/balanced/reasoning)
+   → inference_shim :11500    (OpenAI ↔ Bedrock Converse, per-tier JWT)
+   → SingleStore-hosted Claude (Haiku / Sonnet / Opus)
+```
+
 ---
 
 ## Repository layout
@@ -133,8 +157,8 @@ schema-validated host-side** so data stays uniform across the fleet.
 | `backend/` | FastAPI serving the dashboard (`/api/*`) |
 | `frontend/` | Next.js "trading terminal" dashboard (Recharts) |
 | `schema.sql` | Portfolio-agents schema (prices, memory, orders, fills, NAV, risk, audit) |
-| `research_fleet/research_agent/` | Research-agent runtime: `agent_loop`, `backtest`, `write_tool`, `analyst`, `prompts`, `research_db`, `llm_driver` |
-| `research_fleet/fleet/` | Fleet deploy: userdata, NemoClaw/OpenShell onboard, inference shim, tool server, OpenShell policies, wiring |
+| `research_fleet/research_agent/` | Research-agent runtime: **`agentic_loop`** (host-side Claude tool-use loop), **`agent_tools`** (recall/backtest/sweep/write tools), **`switchyard_transport`** (routes turns through NeMo Switchyard), `backtest`, `write_tool`, `analyst`, `prompts`, `research_db`, `llm_driver` (legacy `agent_loop` retained) |
+| `research_fleet/fleet/` | Fleet deploy: `inference_shim` (OpenAI↔Bedrock-Converse, tool-use + structured output), **`routes.toml`** (Switchyard 3-tier classifier), `systemd/` units, NemoClaw/OpenShell onboard, tool server, policies |
 | `research_fleet/aura/` | **Hosted Aura Analyst proxy**: `aura_proxy.py`, schema, deploy |
 | `research_fleet/research_schema.sql` | Research tables (tasks, hypotheses, experiments, findings, activity, analyst queries) |
 | `docs/PORTFOLIO_AGENTS.md` | Deep-dive on the portfolio-agents subsystem |
