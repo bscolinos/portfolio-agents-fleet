@@ -133,22 +133,46 @@ def run_one_cycle(agent_id: str, focus_area: str | None, *, model: str = "sonnet
                             detail={"experiment_id": eid, "sharpe": erec.get("sharpe"),
                                     "beats_benchmark": erec.get("beats_benchmark")})
 
-        # 5) OPTIONAL: Aura Analyst NL analysis over SingleStore (only if configured)
+        # 5) OPTIONAL: Aura Analyst NL analysis over SingleStore (only if configured).
+        # Instead of one canned question, ask a small battery of genuinely analytical,
+        # cross-cutting questions over the REAL Portal domain — situating THIS run
+        # against the whole fleet's record — so the finding is informed by live data,
+        # not just this single backtest. Each is audited; one failure never aborts the
+        # rest, and Aura being unavailable simply skips the phase (no local NL->SQL).
         analyst_note = ""
         if analyst.available():
-            try:
-                q = (f"Across research_experiments for strategy_family '{family}', what is the average "
-                     f"sharpe and how many experiments beat the benchmark?")
-                a = analyst.ask(q, output_modes=["sql", "data"], agent_id=agent_id)
-                T["record_analyst_query"](agent_id=agent_id, question=q, task_id=tid,
-                                          generated_sql=a.get("sql") or "", row_count=a.get("row_count") or 0,
-                                          answer=(a.get("text") or ""), latency_ms=a.get("latency_ms") or 0.0,
-                                          status="ok" if not a.get("error") else "error")
-                analyst_note = f"\nAura Analyst cross-experiment check: {a.get('rows')}"
-                T["write_activity"](agent_id=agent_id, phase="ANALYST", task_id=tid,
-                                    detail={"question": q, "row_count": a.get("row_count")})
-            except Exception as e:
-                T["write_activity"](agent_id=agent_id, phase="ANALYST", task_id=tid, detail={"error": str(e)[:200]})
+            analyst_questions = [
+                (f"Across research_experiments for strategy_family '{family}', what is the "
+                 f"average sharpe, the average max_drawdown, and how many experiments beat "
+                 f"the benchmark versus the total?"),
+                (f"Among all strategy families in research_experiments, rank them by average "
+                 f"sharpe and show how '{family}' compares."),
+                (f"For strategy_family '{family}', what were the best and worst sharpe values "
+                 f"recorded and their turnover, so I can see the dispersion of outcomes?"),
+            ]
+            analyst_findings: list[str] = []
+            for q in analyst_questions:
+                try:
+                    a = analyst.ask(q, output_modes=["sql", "data", "text"], agent_id=agent_id)
+                    T["record_analyst_query"](agent_id=agent_id, question=q, task_id=tid,
+                                              generated_sql=a.get("sql") or "", row_count=a.get("row_count") or 0,
+                                              answer=(a.get("text") or ""), latency_ms=a.get("latency_ms") or 0.0,
+                                              status="ok" if not a.get("error") else "error")
+                    T["write_activity"](agent_id=agent_id, phase="ANALYST", task_id=tid,
+                                        detail={"question": q, "row_count": a.get("row_count"),
+                                                "error": a.get("error")})
+                    if a.get("error"):
+                        continue
+                    # Prefer Aura's narrated answer; fall back to the raw rows.
+                    detail = a.get("text") or (str(a.get("rows"))[:600] if a.get("rows") else "")
+                    if detail:
+                        analyst_findings.append(f"Q: {q}\nAura: {detail}")
+                except Exception as e:
+                    T["write_activity"](agent_id=agent_id, phase="ANALYST", task_id=tid,
+                                        detail={"question": q, "error": str(e)[:200]})
+            if analyst_findings:
+                analyst_note = ("\n\nAura Analyst cross-experiment analysis over SingleStore:\n"
+                                + "\n\n".join(analyst_findings))
 
         # 6) FINDING (Claude writes the durable, quantitative conclusion)
         finding_txt = llm_driver.complete(

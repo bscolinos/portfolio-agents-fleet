@@ -107,6 +107,9 @@ def _stub_dispatch(monkeypatch):
         seen.append({"name": name, "input": tool_input, "agent_id": agent_id})
         if name == "run_backtest":
             return {"sharpe": 0.42, "beats_benchmark": False, "strategy_family": "momentum"}
+        if name == "ask_analyst":
+            return {"available": True, "sql": "SELECT 1", "rows": [[1]], "row_count": 1,
+                    "text": "one", "error": None}
         if name in ("write_hypothesis", "write_experiment", "write_finding"):
             return {"ok": True, "id": f"{name}-id", "table": name}
         if name == "set_hypothesis_status":
@@ -208,6 +211,39 @@ def test_write_tools_tallied_and_status_ok(_stub_dispatch):
         if last["role"] == "user":
             for b in last["content"]:
                 assert b["toolResult"]["status"] == "success"
+
+
+def test_ask_analyst_tallied_in_summary(_stub_dispatch):
+    client = ScriptedClient([
+        _tool_use_resp("ask_analyst", "aq1",
+                       {"question": "avg sharpe by family"}),
+        _final_resp("Used Aura Analyst to compare families."),
+    ])
+    out = al.run_cycle("unit-agent", "momentum", model="haiku", max_steps=8, client=client)
+    assert out["analyst_queries"] == 1
+    assert "ask_analyst" in out["tool_calls"]
+    # ask_analyst is NOT a write — it must not inflate the write tally
+    assert out["wrote"] == {"hypotheses": 0, "experiments": 0, "findings": 0}
+
+
+def test_ask_analyst_unavailable_not_tallied(monkeypatch):
+    # When Aura is not configured, dispatch returns {available: False}; that is a
+    # clean skip, not a query, and must not be counted.
+    def dispatch_unavailable(name, tool_input, *, agent_id, task_id=None):
+        if name == "ask_analyst":
+            return {"available": False, "note": "not configured"}
+        return {"ok": True}
+
+    monkeypatch.setattr(al.at, "dispatch", dispatch_unavailable)
+    client = ScriptedClient([
+        _tool_use_resp("ask_analyst", "aq1", {"question": "q"}),
+        _final_resp("Aura unavailable; proceeded without it."),
+    ])
+    out = al.run_cycle("unit-agent", "momentum", model="haiku", max_steps=8, client=client)
+    assert out["analyst_queries"] == 0
+    # an {available:false} result is not an error — the toolResult status is success
+    tr = client.calls[1]["messages"][-1]["content"][0]["toolResult"]
+    assert tr["status"] == "success"
 
 
 def test_dispatch_error_marks_toolresult_error_and_not_tallied(monkeypatch):

@@ -92,5 +92,5 @@ trading date (same `_weights_for` logic as the backtest) and pushed through the
 `paper_trader.promote_candidate(...)`: **approved**, $100M deployed across 30
 names (~$25.5K modeled cost) into the shadow book — the real `orders` / `nav_history`
 stayed untouched. This is the intended path: sweep → analyze OOS → gate →
-paper-trade, well before any live order. See
-[`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md) for what still gates real money.
+paper-trade → live. See
+[`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md) for the live-capital roadmap.

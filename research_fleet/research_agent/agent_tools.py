@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from . import analyst
 from . import backtest as bt
 from . import research_db as rdb
 from . import write_tool as wt
@@ -54,8 +55,11 @@ DEFAULT_UNIVERSE_N = 60
 MAX_RECALL_ROWS = 12
 MAX_SWEEP_ROWS = 50
 MAX_EXPERIMENT_ROWS = 50
+MAX_ANALYST_ROWS = 50      # rows of an Aura Analyst result surfaced to the model
 _CONTENT_CLAMP = 1200      # chars of finding content returned on recall
 _PARAMS_CLAMP = 800        # chars of a serialized params blob
+_ANALYST_SQL_CLAMP = 4000  # chars of Aura's generated SQL returned to the model
+_ANALYST_TEXT_CLAMP = 4000 # chars of Aura's narrated answer returned to the model
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +218,51 @@ TOOL_SPECS: list[dict] = [
     },
     {
         "toolSpec": {
+            "name": "ask_analyst",
+            "description": (
+                "Ask SingleStore Aura Analyst an ENGLISH question over the live "
+                "portfolio_agents database and get back the SQL Aura generated, the "
+                "actual rows it returned, and a narrated answer. This is the REAL "
+                "SingleStore Aura Analyst product (governed text-to-SQL over the Portal "
+                "domain) — NOT a local NL->SQL substitute. Use it for deeper, "
+                "cross-cutting DATA ANALYSIS that a single run_backtest cannot give you: "
+                "aggregate across the whole research_experiments / research_findings / "
+                "sweep_results history (e.g. 'which strategy_family has the highest "
+                "average out-of-sample Sharpe and how many of its experiments beat the "
+                "benchmark?'), profile the S&P 500 'prices' table (coverage, gaps, "
+                "volatility regimes), or reconcile what the fleet has actually recorded "
+                "vs. what you believe. Aura runs the SQL for real, so the rows are "
+                "ground truth — treat them as data to interpret, and STILL get any "
+                "strategy performance metric from run_backtest, never from a number you "
+                "invent. Every call is audited to SingleStore automatically. If Aura is "
+                "not configured this returns {available:false} (it never fabricates SQL) "
+                "— in that case, proceed with the other tools."
+            ),
+            "inputSchema": {
+                "json": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The English question to ask Aura Analyst over the "
+                                           "portfolio_agents database, e.g. 'For each strategy_family "
+                                           "in research_experiments, what is the average sharpe and the "
+                                           "count that beat the benchmark?'.",
+                        },
+                        "output_modes": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": ["sql", "data", "text"]},
+                            "description": "What to return: 'sql' (generated SQL), 'data' (rows), "
+                                           "'text' (narrated answer). Default ['sql','data'].",
+                        },
+                    },
+                    "required": ["question"],
+                }
+            },
+        }
+    },
+    {
+        "toolSpec": {
             "name": "write_hypothesis",
             "description": (
                 "Record a falsifiable, quantitative hypothesis BEFORE you backtest it. "
@@ -333,7 +382,10 @@ TOOL_SPECS: list[dict] = [
 ]
 
 # Names the loop is allowed to dispatch (kept in sync with TOOL_SPECS).
-_READ_TOOLS = {"recall_findings", "run_backtest", "query_sweep", "list_recent_experiments"}
+# ask_analyst is a read tool (it reads live data via Aura), but it also self-audits
+# its call to SingleStore — the write is host-side plumbing, not a model-facing write.
+_READ_TOOLS = {"recall_findings", "run_backtest", "query_sweep", "list_recent_experiments",
+               "ask_analyst"}
 _WRITE_TOOLS = {"write_hypothesis", "write_experiment", "write_finding", "set_hypothesis_status"}
 TOOL_NAMES = [s["toolSpec"]["name"] for s in TOOL_SPECS]
 
@@ -516,6 +568,87 @@ def _list_recent_experiments(tool_input: dict) -> dict:
     return {"count": len(out), "experiments": out}
 
 
+def _ask_analyst(tool_input: dict, *, agent_id: str, task_id: str | None) -> dict:
+    """Ask the REAL SingleStore Aura Analyst an NL question over the live DB.
+
+    Delegates to :mod:`analyst` (the hardened Aura proxy -> genuine Portal domain),
+    NEVER a local NL->SQL substitute. If Aura is not configured this returns
+    ``{"available": False, ...}`` so the model proceeds with the other tools rather
+    than fabricating SQL. Every attempt — success, Aura error, or exception — is
+    audited to ``research_analyst_queries`` via the validated write path, so the
+    governance trail matches the fixed-pipeline loop. The result is shaped to be
+    token-efficient (SQL/text clamped, rows capped) but complete enough to reason on.
+    """
+    question = tool_input.get("question")
+    if not question or not str(question).strip():
+        return {"error": "ask_analyst requires a non-empty 'question'"}
+    question = str(question)
+
+    if not analyst.available():
+        # Honest, non-fabricating: tell the model Aura isn't wired up here.
+        return {"available": False,
+                "note": ("Aura Analyst is not configured (no ANALYST_PROXY_URL/TOKEN or "
+                         "ANALYST_API_URL/KEY). No SQL was generated — proceed with the "
+                         "other tools; do NOT invent SQL or rows.")}
+
+    modes = tool_input.get("output_modes")
+    if not isinstance(modes, list) or not modes:
+        modes = ["sql", "data"]
+    modes = [m for m in modes if m in ("sql", "data", "text")] or ["sql", "data"]
+
+    try:
+        a = analyst.ask(question, output_modes=modes, agent_id=agent_id)
+    except Exception as e:  # noqa: BLE001 — surface as a readable result, never raise
+        _audit_analyst(agent_id, question, task_id, sql="", row_count=0,
+                       answer="", latency_ms=0.0, status="error")
+        return {"available": True, "error": f"{type(e).__name__}: {e}",
+                "sql": None, "rows": None, "row_count": 0}
+
+    sql = a.get("sql")
+    rows = a.get("rows")
+    row_count = a.get("row_count")
+    text = a.get("text")
+    err = a.get("error")
+
+    # audit (best-effort; must never break the tool)
+    _audit_analyst(agent_id, question, task_id,
+                   sql=sql or "", row_count=int(row_count or 0), answer=text or "",
+                   latency_ms=_round(a.get("latency_ms"), 2) or 0.0,
+                   status="error" if err else "ok")
+
+    # shape a compact, complete result for the model
+    shaped_rows = rows[:MAX_ANALYST_ROWS] if isinstance(rows, list) else rows
+    truncated = bool(isinstance(rows, list) and len(rows) > MAX_ANALYST_ROWS)
+    return {
+        "available": True,
+        "question": _shorten(question, 2000),
+        "sql": _shorten(sql, _ANALYST_SQL_CLAMP) if sql else None,
+        "columns": a.get("columns"),
+        "rows": shaped_rows,
+        "row_count": int(row_count) if row_count is not None else (
+            len(rows) if isinstance(rows, list) else None),
+        "rows_truncated": truncated,
+        "text": _shorten(text, _ANALYST_TEXT_CLAMP) if text else None,
+        "confidence": _round(a.get("confidence"), 4),
+        "tables_used": a.get("tables_used"),
+        "cached": a.get("cached"),
+        "latency_ms": _round(a.get("latency_ms"), 2),
+        "error": err,
+    }
+
+
+def _audit_analyst(agent_id: str, question: str, task_id: str | None, *,
+                   sql: str, row_count: int, answer: str, latency_ms: float,
+                   status: str) -> None:
+    """Record an Aura Analyst query to research_analyst_queries (best-effort)."""
+    try:
+        wt.record_analyst_query(agent_id=agent_id, question=question, task_id=task_id,
+                                generated_sql=sql, row_count=row_count, answer=answer,
+                                latency_ms=latency_ms, status=status)
+    except Exception:  # noqa: BLE001 — auditing must never break the agent loop
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Dispatch — route one tool call to the real implementation (NEVER raises)
 # ---------------------------------------------------------------------------
@@ -545,6 +678,9 @@ def dispatch(name: str, tool_input: dict, *, agent_id: str, task_id: str | None 
             return _query_sweep(tool_input)
         if name == "list_recent_experiments":
             return _list_recent_experiments(tool_input)
+        if name == "ask_analyst":
+            # identity is injected host-side so the audited query is attributed correctly
+            return _ask_analyst(tool_input, agent_id=agent_id, task_id=task_id)
 
         if name in _WRITE_TOOLS:
             payload = dict(tool_input)  # copy — never mutate the model's input
@@ -589,12 +725,20 @@ def system_prompt(focus_area: str) -> str:
         f"knowledge rather than repeat settled experiments. Then form a falsifiable "
         f"hypothesis (write_hypothesis), run a REAL backtest (run_backtest), and "
         f"interpret it HONESTLY — a strategy that does NOT beat the 1/N equal-weight "
-        f"benchmark net of cost is a valid, reportable finding. Persist the full arc: "
+        f"benchmark net of cost is a valid, reportable finding. For deeper, "
+        f"cross-cutting analysis that a single backtest cannot answer — aggregating "
+        f"across the whole experiment/finding/sweep history, profiling the S&P 500 "
+        f"price data, or reconciling what the fleet has actually recorded — use "
+        f"ask_analyst to put the question to the REAL SingleStore Aura Analyst "
+        f"(governed text-to-SQL over the live database); it returns the SQL, the real "
+        f"rows, and a narrated answer, and every call is audited. Persist the full arc: "
         f"write_hypothesis -> write_experiment (with the exact run_backtest metrics) "
         f"-> write_finding (quantitative, honest, with a concrete next step) -> "
         f"set_hypothesis_status. Then choose the next experiment. NEVER invent "
-        f"metrics — every number must come from run_backtest. Be quantitative and "
-        f"honest about overfitting: weigh in-sample vs out-of-sample, treat tiny "
-        f"Sharpe gaps as noise, and prefer edges that survive out of sample."
+        f"metrics — every performance number must come from run_backtest, and any "
+        f"data fact must come from run_backtest or ask_analyst, never from a number "
+        f"you made up. Be quantitative and honest about overfitting: weigh in-sample "
+        f"vs out-of-sample, treat tiny Sharpe gaps as noise, and prefer edges that "
+        f"survive out of sample."
     )
     return base + directive

@@ -1,14 +1,15 @@
-# Production Readiness — pre-real-money hardening
+# Production Readiness — safety layer & live-capital roadmap
 
-**Context.** The best research agent is slated to trade **real capital**. This
-document is the go/no-go summary: what was hardened, what the verified numbers
-say, and what still gates a live order. It is deliberately honest — trust the
-computed metrics and the gate, not any headline Sharpe.
+**Context.** The best research agent is built to trade **real capital**. This
+document is the summary: what was hardened, what the verified numbers say, and
+what to wire to route live orders. It reports honestly — trust the computed
+metrics and the gate, not any headline Sharpe.
 
-**Scope of this pass: safety-first.** Everything that MUST precede a live order —
+**Scope of this pass: safety-first.** Everything that must precede a live order —
 correct winner selection, a hard risk/execution gate, a kill switch, and a
-paper-trading harness — is done and verified. A **real brokerage adapter is
-intentionally NOT wired** (see §4); until it is, run paper mode only.
+paper-trading harness — is done and verified. Paper mode is the default execution
+sink; a **real brokerage adapter** is the remaining integration to route the same
+gated decisions to a live venue (see §4).
 
 ---
 
@@ -90,9 +91,13 @@ still bounded by the gross cap); all other checks apply.
 
 ---
 
-## 4. What still gates a REAL-MONEY order (honest)
+## 4. Connecting live capital (roadmap)
 
-1. **No real broker adapter** — `mode='live'` uses the internal simulated book.
+Paper mode is the default execution sink and the gate/kill-switch/audit path is
+identical for paper and live — only the sink changes. To route the same gated
+decisions to a live venue, wire the following:
+
+1. **Broker adapter** — `mode='live'` currently uses the internal simulated book.
    Real order routing (FIX/REST, order-state reconciliation, partial fills,
    cancels/rejects, DMA throttles) is the single largest remaining piece.
 2. **No ADV/liquidity data** — the notional guard is an absolute $ cap, not a
@@ -106,11 +111,11 @@ still bounded by the gross cap); all other checks apply.
 6. **LLM finding prose can cite fabricated priors** — the numbers are trustworthy
    (computed by the corrected engine); the narrative is not evidence.
 
-**Recommendation:** paper-trade the re-scored winner through the gate first;
-watch the `paper_nav_history` curve; do not authorize live until items 1–3 are
-addressed. The infra Aura proxy is separately production-grade
-([`research_fleet/aura/`](research_fleet/aura/)); HA/alerting for it was out of
-this safety-first scope.
+**Recommended path:** paper-trade the re-scored winner through the gate, watch
+the `paper_nav_history` curve, then connect items 1–3 to route live capital
+through the same gate. The infra Aura proxy is production-grade
+([`research_fleet/aura/`](research_fleet/aura/)); adding HA/alerting for it is a
+straightforward follow-on.
 
 ---
 

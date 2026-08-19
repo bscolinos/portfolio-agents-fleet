@@ -66,6 +66,7 @@ def test_all_expected_tools_present():
     names = set(s["toolSpec"]["name"] for s in at.TOOL_SPECS)
     expected = {
         "recall_findings", "run_backtest", "query_sweep", "list_recent_experiments",
+        "ask_analyst",
         "write_hypothesis", "write_experiment", "write_finding", "set_hypothesis_status",
     }
     assert expected <= names, f"missing tools: {expected - names}"
@@ -101,6 +102,103 @@ def test_bad_family_write_returns_error_not_raise():
     assert out.get("ok") is False and "error" in out
     # no id was minted for an invalid write
     assert "id" not in out
+
+
+# ---------------------------------------------------------------------------
+# ask_analyst — the Aura Analyst tool (no DB / no network; analyst is stubbed)
+# ---------------------------------------------------------------------------
+
+def test_ask_analyst_unconfigured_returns_available_false(monkeypatch):
+    # Aura not configured => honest {available: False}, no fabricated SQL, no raise.
+    monkeypatch.setattr(at.analyst, "available", lambda: False)
+    # audit must not be attempted (and even if it were, must not raise) — stub it.
+    monkeypatch.setattr(at.wt, "record_analyst_query", lambda **k: {"ok": True})
+    out = at.dispatch("ask_analyst", {"question": "what is the average sharpe?"},
+                      agent_id="unit")
+    assert isinstance(out, dict)
+    assert out.get("available") is False
+    assert out.get("sql") is None
+    assert "error" not in out  # not-configured is a clean skip, not an error
+
+
+def test_ask_analyst_missing_question_returns_error(monkeypatch):
+    monkeypatch.setattr(at.analyst, "available", lambda: True)
+    out = at.dispatch("ask_analyst", {"question": "   "}, agent_id="unit")
+    assert isinstance(out, dict) and "error" in out
+
+
+def test_ask_analyst_shapes_result_and_audits(monkeypatch):
+    # Stub a configured Aura that returns a real-looking flattened payload.
+    monkeypatch.setattr(at.analyst, "available", lambda: True)
+
+    def fake_ask(question, output_modes=None, agent_id="", **k):
+        return {"sql": "SELECT strategy_family, AVG(sharpe) FROM research_experiments GROUP BY 1",
+                "confidence": 0.91, "tables_used": ["research_experiments"],
+                "columns": ["strategy_family", "avg_sharpe"],
+                "rows": [["momentum", 0.42], ["low_vol", 0.55]],
+                "row_count": 2, "text": "low_vol has the highest average sharpe.",
+                "error": None, "cached": False, "latency_ms": 123.4}
+
+    captured = {}
+
+    def fake_audit(**kw):
+        captured.update(kw)
+        return {"ok": True, "id": "aq-x"}
+
+    monkeypatch.setattr(at.analyst, "ask", fake_ask)
+    monkeypatch.setattr(at.wt, "record_analyst_query", fake_audit)
+
+    out = at.dispatch("ask_analyst",
+                      {"question": "avg sharpe by family", "output_modes": ["sql", "data", "text"]},
+                      agent_id="unit-agent", task_id="task-1")
+    assert out["available"] is True
+    assert out["error"] is None
+    assert out["sql"].startswith("SELECT")
+    assert out["row_count"] == 2
+    assert out["rows"] == [["momentum", 0.42], ["low_vol", 0.55]]
+    assert out["text"].startswith("low_vol")
+    # audited with the host-injected identity (not spoofable by the model)
+    assert captured.get("agent_id") == "unit-agent"
+    assert captured.get("task_id") == "task-1"
+    assert captured.get("status") == "ok"
+    assert "research_experiments" in (captured.get("generated_sql") or "")
+
+
+def test_ask_analyst_upstream_exception_is_caught_and_audited(monkeypatch):
+    monkeypatch.setattr(at.analyst, "available", lambda: True)
+
+    def boom(*a, **k):
+        raise RuntimeError("aura upstream exploded")
+
+    audited = {}
+    monkeypatch.setattr(at.analyst, "ask", boom)
+    monkeypatch.setattr(at.wt, "record_analyst_query",
+                        lambda **kw: audited.update(kw) or {"ok": True})
+
+    out = at.dispatch("ask_analyst", {"question": "q"}, agent_id="unit")
+    # never raises: returns a readable error result
+    assert isinstance(out, dict)
+    assert out.get("available") is True
+    assert "aura upstream exploded" in out.get("error", "")
+    assert audited.get("status") == "error"
+
+
+def test_ask_analyst_caps_returned_rows(monkeypatch):
+    monkeypatch.setattr(at.analyst, "available", lambda: True)
+    big = [[i, i * 1.0] for i in range(at.MAX_ANALYST_ROWS + 25)]
+
+    def fake_ask(question, output_modes=None, agent_id="", **k):
+        return {"sql": "SELECT 1", "rows": big, "row_count": len(big),
+                "text": None, "error": None, "latency_ms": 1.0}
+
+    monkeypatch.setattr(at.analyst, "ask", fake_ask)
+    monkeypatch.setattr(at.wt, "record_analyst_query", lambda **k: {"ok": True})
+
+    out = at.dispatch("ask_analyst", {"question": "q"}, agent_id="unit")
+    assert len(out["rows"]) == at.MAX_ANALYST_ROWS
+    assert out["rows_truncated"] is True
+    # the true row_count is still reported honestly
+    assert out["row_count"] == len(big)
 
 
 # ---------------------------------------------------------------------------

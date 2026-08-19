@@ -2,8 +2,8 @@
 
 This is the operator runbook for the safety layer that sits between a quant
 research **finding** and any real-money **order**. Nothing trades until it clears
-the gate. The gate is the *same* for paper and (future) live — only the
-execution sink differs.
+the gate. The gate is the *same* for paper and live — only the execution sink
+differs.
 
 **Posture: DEFAULT-DENY / FAIL-CLOSED.** If a required input is missing or
 unreadable (no prices, no NAV, unreadable book/history, unreadable kill switch),
@@ -171,12 +171,12 @@ gate and routes fills to the shadow book, never the real one.
 
 ---
 
-## 5. What is still NOT covered before real money (be honest)
+## 5. Connecting live capital (roadmap)
 
-The gate is the safety *decision* layer. These gaps remain before a live,
-real-capital order can safely leave the building:
+The gate is the safety *decision* layer and is identical for paper and live. To
+route a live, real-capital order through it, wire the following:
 
-1. **No real broker adapter.** `mode='live'` calls `trading.rebalance(...)`, the
+1. **Broker adapter.** `mode='live'` calls `trading.rebalance(...)`, the
    internal *simulated* book. Sending real orders to an execution venue
    (FIX/REST, order-state reconciliation, partial fills, cancels/rejects, DMA
    throttles) is **not implemented**. This is the single largest remaining piece.
@@ -194,10 +194,11 @@ real-capital order can safely leave the building:
 5. **Drawdown/daily-loss depend on `nav_history` fidelity.** For a fresh agent
    with no history these breakers no-op by design. They are only as good as the
    daily marks feeding `nav_history`.
-6. **No pre-trade compliance/restricted-list, wash-trade, or borrow checks.**
-   Out of scope here; required before real money.
+6. **Pre-trade compliance/restricted-list, wash-trade, and borrow checks.**
+   Add these to the gate before routing live capital.
 7. **Single-writer assumption.** The gate reads the book, decides, then trades;
    there is no cross-process lock. Concurrent rebalances of the *same* agent
    could race. Serialize per-agent execution (or add an advisory lock) for live.
 
-Until items 1–3 are addressed, run **paper mode only**.
+Paper mode is the default execution sink; connect items 1–3 to route live capital
+through the same gate.

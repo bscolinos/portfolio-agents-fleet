@@ -104,20 +104,29 @@ def _kickoff_message(focus: str, cycle_type: str = "standard") -> dict:
             f"Begin a LIGHT survey cycle (low complexity). Recall what you and the "
             f"fleet already know about {focus} (recall_findings), scan the completed "
             f"sweep (query_sweep) and recent experiments (list_recent_experiments), "
-            f"and write a short consolidating insight (write_finding, kind='insight') "
-            f"summarizing the current state of {focus} — no new backtest required "
-            f"unless a quick confirming run is clearly warranted. {common}"
+            f"and use ask_analyst to get a fast cross-cutting read on the fleet's own "
+            f"record (e.g. via Aura Analyst, the average sharpe and benchmark-beating "
+            f"count for {focus} across research_experiments). Then write a short "
+            f"consolidating insight (write_finding, kind='insight') summarizing the "
+            f"current state of {focus} — no new backtest required unless a quick "
+            f"confirming run is clearly warranted. {common}"
         )
     elif cycle_type == "deep":
         text = (
             f"Begin a DEEP design cycle (HIGH complexity — this may inform a "
             f"real-money allocation). Recall prior {focus} findings and the sweep, "
             f"then rigorously reason about robustness: reconcile any in-sample vs "
-            f"out-of-sample gaps, design and RUN a validation-oriented backtest "
-            f"(e.g. a different regime/window or a stress of the current best {focus} "
-            f"config), and record a hypothesis, an experiment (EXACT run_backtest "
-            f"metrics), and an honest finding that states whether the edge is robust "
-            f"or likely overfit, then set the hypothesis status. {common}"
+            f"out-of-sample gaps. Use ask_analyst to interrogate the live database "
+            f"with SingleStore Aura Analyst for the deeper cross-cutting questions a "
+            f"single backtest cannot answer — aggregate {focus} results across the "
+            f"whole research_experiments/research_findings history, profile the S&P "
+            f"500 'prices' coverage or the regime you are stressing, and reconcile "
+            f"what the fleet has actually recorded against what you believe. Then "
+            f"design and RUN a validation-oriented backtest (e.g. a different "
+            f"regime/window or a stress of the current best {focus} config), and "
+            f"record a hypothesis, an experiment (EXACT run_backtest metrics), and an "
+            f"honest finding that states whether the edge is robust or likely "
+            f"overfit, then set the hypothesis status. {common}"
         )
     else:  # standard
         text = (
@@ -126,7 +135,11 @@ def _kickoff_message(focus: str, cycle_type: str = "standard") -> dict:
             f"list_recent_experiments), decide the single most valuable {focus} "
             f"experiment to run next, run a REAL backtest (run_backtest), and record "
             f"a hypothesis, an experiment (with the EXACT run_backtest metrics), and "
-            f"an honest finding, then set the hypothesis status. {common}"
+            f"an honest finding, then set the hypothesis status. Where a cross-cutting "
+            f"data question would sharpen the finding (how this result compares to the "
+            f"rest of the fleet's {focus} experiments, or a fact about the underlying "
+            f"prices), put it to SingleStore Aura Analyst via ask_analyst rather than "
+            f"guessing. {common}"
         )
     return {"role": "user", "content": [{"text": text}]}
 
@@ -199,8 +212,8 @@ def run_cycle(agent_id: str, focus: str, *, model: str = "sonnet",
 
     Returns a summary dict:
         {agent_id, focus, model, transport, steps, tool_calls: [names],
-         wrote: {hypotheses, experiments, findings}, final_text, capped,
-         tiers: [chosen model per turn], error?}
+         wrote: {hypotheses, experiments, findings}, analyst_queries: int,
+         final_text, capped, tiers: [chosen model per turn], error?}
     """
     model_id, key = llm_driver.MODELS.get(model, llm_driver.MODELS.get("sonnet", ("", "")))
     summary: dict[str, Any] = {
@@ -212,6 +225,7 @@ def run_cycle(agent_id: str, focus: str, *, model: str = "sonnet",
         "steps": 0,
         "tool_calls": [],
         "wrote": {"hypotheses": 0, "experiments": 0, "findings": 0},
+        "analyst_queries": 0,
         "final_text": "",
         "capped": False,
         "tiers": [],
@@ -274,6 +288,11 @@ def run_cycle(agent_id: str, focus: str, *, model: str = "sonnet",
                 is_err = _is_error_result(result)
                 if not is_err and name in _WRITE_COUNTERS:
                     summary["wrote"][_WRITE_COUNTERS[name]] += 1
+                # Count a real Aura Analyst call (Aura configured + no error). An
+                # {available:false} result is not a query and is not tallied.
+                if (name == "ask_analyst" and isinstance(result, dict)
+                        and result.get("available") is True and not result.get("error")):
+                    summary["analyst_queries"] += 1
 
                 _safe_activity(agent_id, "TOOL",
                                {"tool": name, "ok": not is_err,
@@ -304,7 +323,8 @@ def run_cycle(agent_id: str, focus: str, *, model: str = "sonnet",
 
     _safe_activity(agent_id, "END", {
         "steps": summary["steps"], "tool_calls": summary["tool_calls"],
-        "wrote": summary["wrote"], "capped": summary["capped"],
+        "wrote": summary["wrote"], "analyst_queries": summary["analyst_queries"],
+        "capped": summary["capped"],
         "transport": transport, "tiers": summary["tiers"],
         "error": summary.get("error"),
     })
@@ -376,10 +396,11 @@ def main(argv=None):
             note = f" ERROR={summary['error']}" if summary.get("error") else ""
             cap = " CAPPED" if summary.get("capped") else ""
             tiers = f" tiers={summary['tiers']}" if summary.get("tiers") else ""
+            aq = f" aura={summary['analyst_queries']}" if summary.get("analyst_queries") else ""
             print(f"[{args.agent_id}] cycle {cycles} [{ctype}]: steps={summary['steps']} "
                   f"tools={summary['tool_calls']} "
                   f"wrote(h/e/f)={w['hypotheses']}/{w['experiments']}/{w['findings']}"
-                  f"{tiers}{cap}{note}", flush=True)
+                  f"{aq}{tiers}{cap}{note}", flush=True)
             rdb.heartbeat(args.agent_id)
 
             if args.once:

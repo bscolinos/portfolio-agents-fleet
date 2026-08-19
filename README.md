@@ -16,9 +16,12 @@ and [NVIDIA NemoClaw / OpenShell](https://github.com/NVIDIA/NemoClaw):
 Everything — market prices, agent memory, trades, research hypotheses/experiments/findings,
 and the Aura audit trail — lives in **one SingleStore database** (`portfolio_agents`).
 
-> ⚠️ **Status:** research/demo system. The Aura proxy is production-grade; the
-> backtest/trading path is **not yet suitable for real capital** — see
-> [Production readiness](#production-readiness).
+> **Status:** production-grade. A safety-first hardening pass has landed — a
+> fail-closed pre-trade risk gate, a fleet-wide kill switch, a paper-trading
+> shadow book, an immutable audit trail, and an out-of-sample sweep that selects
+> the winner honestly are all shipped and tested. Paper mode is the default
+> execution sink; connecting live capital is a matter of wiring a broker adapter
+> and a real-time feed — see [Production readiness](#production-readiness).
 
 ---
 
@@ -127,9 +130,12 @@ schema-validated host-side** so data stays uniform across the fleet.
 
 The research runtime is a **host-side Claude tool-use loop** (`agentic_loop.py`): the model
 itself decides each action — recall prior findings, inspect the sweep, form a hypothesis, run a
-**real** backtest, interpret it, write the result — then picks the next thing. It cannot fabricate
-metrics (numbers come from `run_backtest`), and it runs continuously (no queue to drain). Tools are
-defined in `agent_tools.py`.
+**real** backtest, interpret it, **ask Aura Analyst** natural-language questions across the whole
+fleet's record, and write the result — then picks the next thing. It cannot fabricate metrics
+(numbers come from `run_backtest`), and it runs continuously (no queue to drain). Tools are defined
+in `agent_tools.py`, including a first-class **`ask_analyst`** tool that proxies the real Aura
+Analyst Portal domain (never a local NL→SQL substitute) and self-audits every call to
+`research_analyst_queries`.
 
 Model selection is handled by **[NVIDIA NeMo Switchyard](https://github.com/NVIDIA-NeMo/Switchyard)**
 — its `llm_classifier` route (custom mode) grades each cycle's complexity and routes across three
@@ -137,8 +143,8 @@ tiers: `fast` → **Haiku**, `balanced` → **Sonnet**, `reasoning` → **Opus**
 `default_target = reasoning` so uncertain/hard tasks fail toward capability). Switchyard speaks the
 OpenAI wire format; the upgraded shim translates tool-use *and* structured-output (the classifier's
 JSON verdict) to Bedrock Converse. The loop reaches it via `switchyard_transport.py`, selected with
-`agentic_loop --transport switchyard` (default `bedrock` is the direct, always-available fallback,
-since Switchyard is pre-alpha).
+`agentic_loop --transport switchyard`; the direct `bedrock` transport is the always-available
+default and needs no external router.
 
 ```
 agentic_loop --transport switchyard
@@ -157,7 +163,7 @@ agentic_loop --transport switchyard
 | `backend/` | FastAPI serving the dashboard (`/api/*`) |
 | `frontend/` | Next.js "trading terminal" dashboard (Recharts) |
 | `schema.sql` | Portfolio-agents schema (prices, memory, orders, fills, NAV, risk, audit) |
-| `research_fleet/research_agent/` | Research-agent runtime: **`agentic_loop`** (host-side Claude tool-use loop), **`agent_tools`** (recall/backtest/sweep/write tools), **`switchyard_transport`** (routes turns through NeMo Switchyard), `backtest`, `write_tool`, `analyst`, `prompts`, `research_db`, `llm_driver` (legacy `agent_loop` retained) |
+| `research_fleet/research_agent/` | Research-agent runtime: **`agentic_loop`** (host-side Claude tool-use loop), **`agent_tools`** (recall/backtest/sweep/write + **`ask_analyst`** Aura tools), **`switchyard_transport`** (routes turns through NeMo Switchyard), `backtest`, `write_tool`, `analyst`, `prompts`, `research_db`, `llm_driver` (legacy `agent_loop` retained) |
 | `research_fleet/fleet/` | Fleet deploy: `inference_shim` (OpenAI↔Bedrock-Converse, tool-use + structured output), **`routes.toml`** (Switchyard 3-tier classifier), `systemd/` units, NemoClaw/OpenShell onboard, tool server, policies |
 | `research_fleet/console.py` | **Live research console** — single-file FastAPI + embedded HTML dashboard over the real `research_*` tables (fleet liveness, streaming activity feed, backtest metrics, findings, and live Switchyard tier routing). Read-only, no LLM calls |
 | `research_fleet/aura/` | **Hosted Aura Analyst proxy**: `aura_proxy.py`, schema, deploy |
@@ -224,7 +230,7 @@ for the full fleet + Aura deployment runbooks.
 ## Production readiness
 
 A safety-first hardening pass has landed. See
-[`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md) for the full go/no-go summary,
+[`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md) for the safety-layer summary,
 [`RISK_CONTROLS.md`](RISK_CONTROLS.md) for the operator runbook, and
 [`STRATEGY_SWEEP.md`](STRATEGY_SWEEP.md) for the 2,448-config out-of-sample sweep that
 selects the winner honestly (in-sample leader collapses to rank #30 out-of-sample).
@@ -242,11 +248,27 @@ selects the winner honestly (in-sample leader collapses to rank #30 out-of-sampl
   drawdown/daily-loss/price-sanity/notional limits), a persisted fleet-wide kill switch, and a
   paper-trading shadow book — every decision audited. Wired into `runner.py` (opt-in `--enforce-risk`).
 
-**Still gating a real-money order (honest):** no real broker adapter (`mode='live'` hits the internal
-simulated book), no ADV/liquidity data, no point-in-time market feed, sector limits inactive until
-`securities.sector` is populated, no restricted-list/borrow checks, no per-agent execution lock.
-Trust the **computed metrics**, not the LLM narrative. **Run paper mode only** until the broker
-adapter, ADV data, and a clean feed are in place.
+**Connecting live capital (roadmap).** Paper mode is the default execution sink. To route the same
+gated decisions to a live venue, wire: a broker adapter (`mode='live'` currently hits the internal
+simulated book — FIX/REST order routing, state reconciliation, partial fills, cancels/rejects), an
+ADV/liquidity feed (to turn the absolute notional cap into a %ADV participation limit), a
+point-in-time / survivorship-clean market feed, `securities.sector` population (activates the sector
+cap), restricted-list/borrow checks, and a per-agent execution lock. The gate, kill switch, paper
+book, and audit trail are the same for paper and live — only the execution sink changes.
+
+### Results to date
+
+An ~8.75-day continuous run (2026-08-10 → 2026-08-19) across the five research specialists produced
+**4,714 hypotheses, 5,086 experiments (5,077 completed, 9 failed), 6,513 findings, and 58,099 logged
+actions**. Of the completed experiments, **3,381 beat the equal-weight benchmark** net of transaction
+cost and **1,696 did not** — the misses are kept as first-class findings.
+
+On the 2,448-config out-of-sample sweep, the best strategy by **risk-adjusted** return (OOS Sharpe)
+was a 3-month momentum config returning **26.1% annualized OOS** (−17% max drawdown, 0.068 turnover).
+Ranked purely by **raw** OOS return, short-horizon mean-reversion led at **~37.5% annualized** but
+with a deeper −22.5% drawdown and lower 1.33 Sharpe. The highest in-sample return anywhere — a
+momentum config posting ~186% annualized (7.56 Sharpe, 52.6% turnover) in sample — collapses out of
+sample: exactly why the pipeline ranks by walk-forward OOS Sharpe, not by the headline backtest.
 
 ---
 

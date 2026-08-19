@@ -35,12 +35,14 @@ the raw JWT never enters the sandbox. NemoClaw is onboarded as
 ```
 5x EC2 t3.xlarge (Ubuntu 24.04, same VPC/subnet as the L4 GPU box, us-east-1c)
 each node:
+  ├ switchyard.service       NeMo Switchyard router :4000 (complexity → tier)
   ├ inference-shim.service   OpenAI→Bedrock shim :11500  (fleet/inference_shim.py)
   ├ NemoClaw + OpenShell     docker sandbox running OpenClaw v2026.7.1
-  └ research-agent.service   the loop (research_agent/agent_loop.py):
-        claim task ─▶ recall prior findings (VECTOR <*>) ─▶ hypothesize (Claude)
-        ─▶ backtest over SingleStore prices ─▶ (Aura Analyst NL analysis)
-        ─▶ write finding (embed + persist) ─▶ mark done ─▶ loop
+  └ research-agent.service   the agentic loop (research_agent/agentic_loop.py):
+        the model itself drives each step via tools (agent_tools.py) —
+        recall findings (VECTOR <*>) ─▶ query the sweep ─▶ hypothesize
+        ─▶ run a REAL backtest ─▶ ask Aura Analyst (NL→SQL, real Portal)
+        ─▶ write hypothesis/experiment/finding (embed + persist) ─▶ loop 24/7
                               │
                               ▼
              SingleStore  portfolio_agents DB  (results accumulate over time)
@@ -61,9 +63,19 @@ each node:
     risk_parity, regime — all vs a 1/N benchmark.
   - `llm_driver.py` — Claude via the code-factory Bedrock-Converse+Bearer path
     (structured hypothesis JSON + finding text).
-  - `analyst.py` — Aura Analyst `/analyst/query` client; `available()` gates on
-    `ANALYST_API_URL`/`ANALYST_API_KEY` and SKIPS if unset (never substitutes).
-  - `agent_loop.py` — the claim→recall→hypothesize→backtest→analyze→finding loop.
+  - `analyst.py` — Aura Analyst client (reaches the hosted proxy); `available()`
+    gates on config and SKIPS if unset (never substitutes a local NL→SQL).
+  - `agentic_loop.py` — **the live runtime**: a host-side Claude tool-use loop
+    where the model decides each action and runs continuously (no queue to
+    drain). `run_cycle(agent_id, focus, ...)`; `--transport {bedrock,switchyard}`.
+  - `agent_tools.py` — the 8 Bedrock Converse tools the model calls:
+    `recall_findings`, `run_backtest` (REAL, cost-corrected engine), `query_sweep`,
+    `list_recent_experiments`, `write_hypothesis/experiment/finding`,
+    `set_hypothesis_status`, and **`ask_analyst`** (proxies the real Aura Portal
+    domain, self-audits to `research_analyst_queries`, never fabricates).
+  - `switchyard_transport.py` — routes each turn through NVIDIA NeMo Switchyard
+    (complexity classifier → Haiku/Sonnet/Opus); direct `bedrock` is the default.
+  - `agent_loop.py` — the original rules pipeline, retained for reference.
 - `fleet/` — deployment:
   - `inference_shim.py` — the OpenAI→Bedrock shim.
   - `userdata_base.sh` — thin EC2 userdata (docker + node22 + python).
@@ -91,6 +103,17 @@ PY
 ```
 
 `.env` is read from the demo root (`../.env`) or `/opt/research-agent/.env` on a node.
+
+## Results
+
+Over an ~8.75-day continuous run (2026-08-10 → 2026-08-19), the five specialists
+produced **4,714 hypotheses, 5,086 experiments (5,077 completed, 9 failed),
+6,513 findings, and 58,099 logged actions**. Of the completed experiments,
+**3,381 beat the equal-weight benchmark** net of transaction cost and **1,696 did
+not** — misses are kept as first-class findings. Every finding carries real
+metrics JSON + a Qwen embedding for fleet-wide recall. See
+[`STRATEGY_SWEEP.md`](../STRATEGY_SWEEP.md) for the 2,448-config out-of-sample
+sweep that selects the honest winner (OOS Sharpe 1.533, 26.1% annualized OOS).
 
 ## Live infra (as built 2026-08-10)
 

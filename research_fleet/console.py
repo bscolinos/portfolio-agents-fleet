@@ -195,6 +195,33 @@ def experiments(limit: int = 12) -> list[dict]:
     return rows
 
 
+def analyst_queries(limit: int = 15) -> list[dict]:
+    """Recent NL questions the fleet asked SingleStore Aura Analyst (Portal text-to-SQL).
+
+    Every agent question routed through the real Aura Analyst domain lands in
+    research_analyst_queries — the generated SQL, row count, answer, and latency.
+    Degrades to [] if the table isn't present yet (fleet not wired to Aura here).
+    """
+    try:
+        rows = _q(
+            """
+            SELECT query_id, agent_id, question,
+                   LEFT(generated_sql, 600) AS generated_sql,
+                   row_count, LEFT(answer, 400) AS answer,
+                   latency_ms, status, created_at
+            FROM research_analyst_queries
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (int(limit),),
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    for r in rows:
+        r["created_at"] = _iso(r["created_at"])
+    return rows
+
+
 def routing() -> dict:
     """Parse NeMo Switchyard tier decisions out of recent END activity rows.
 
@@ -261,6 +288,7 @@ def api_snapshot() -> JSONResponse:
                 "activity": activity(60),
                 "findings": findings(10),
                 "experiments": experiments(10),
+                "analyst": analyst_queries(15),
             }
         )
     except Exception as e:  # noqa: BLE001
@@ -290,6 +318,11 @@ def api_experiments(limit: int = 12) -> JSONResponse:
 @app.get("/api/routing")
 def api_routing() -> JSONResponse:
     return JSONResponse(routing())
+
+
+@app.get("/api/analyst")
+def api_analyst(limit: int = 15) -> JSONResponse:
+    return JSONResponse(analyst_queries(limit))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -359,6 +392,15 @@ PAGE = r"""<!doctype html>
   .find .body{color:#c3cde0;font-size:12.5px}
   .fam{display:inline-block;padding:1px 7px;border-radius:6px;
     background:#1b2440;color:var(--cyan);font-size:11px;margin-right:6px}
+  .aq{padding:10px 0;border-bottom:1px solid var(--line)}
+  .aq:last-child{border-bottom:none}
+  .aq .q{font-weight:600;margin-bottom:4px}
+  .aq .meta{font-size:11px;color:var(--dim);margin-bottom:5px}
+  .aq .sql{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;
+    color:#9fe0c0;background:var(--panel2);border:1px solid var(--line);border-radius:6px;
+    padding:6px 8px;white-space:pre-wrap;word-break:break-word;max-height:96px;overflow:auto}
+  .st{display:inline-block;padding:1px 7px;border-radius:6px;font-size:11px;margin-left:6px}
+  .st.ok{background:#12321f;color:var(--green)} .st.err{background:#331519;color:var(--red)}
   table{width:100%;border-collapse:collapse;font-size:12.5px}
   th{text-align:right;color:var(--dim);font-weight:500;font-size:11px;text-transform:uppercase;
     padding:6px 8px;border-bottom:1px solid var(--line)}
@@ -391,6 +433,10 @@ PAGE = r"""<!doctype html>
       </div>
     </div>
     <div class="col">
+      <div class="card">
+        <h2>Aura Analyst — NL→SQL over SingleStore</h2>
+        <div class="body" id="analyst"></div>
+      </div>
       <div class="card">
         <h2>Live activity feed</h2>
         <div class="body feed" id="feed"></div>
@@ -484,6 +530,19 @@ function render(s){
         ${esc(f.agent_id)} · ${ago(f.created_at)}</div>
       <div class="body">${esc((f.content||"").replace(/\*\*/g,""))}</div>
     </div>`).join("")||'<div class="fa">no findings</div>';
+
+  // analyst (Aura Analyst NL→SQL)
+  document.getElementById("analyst").innerHTML=(s.analyst||[]).map(a=>{
+    const bad=String(a.status||"").toLowerCase()!=="ok"&&String(a.status||"").toLowerCase()!=="success";
+    return `<div class="aq">
+      <div class="q">${esc(a.question||"(no question)")}
+        <span class="st ${bad?"err":"ok"}">${esc(a.status||"—")}</span></div>
+      <div class="meta"><span class="fam">Aura Analyst</span>${esc(a.agent_id)} ·
+        ${a.row_count!=null?esc(a.row_count)+" rows":"—"} ·
+        ${a.latency_ms!=null?Math.round(a.latency_ms)+"ms":"—"} · ${ago(a.created_at)}</div>
+      ${a.generated_sql?`<div class="sql">${esc(a.generated_sql)}</div>`:""}
+    </div>`;
+  }).join("")||'<div class="fa">no Aura Analyst queries yet</div>';
 }
 
 let lastOk=0;
